@@ -1,134 +1,210 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// One job: boot the game. Owns input, the frame loop, menus and saves, and
+// drives the deterministic screenshot capture without animation frames.
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+import { createWorld, stepWorld, snapshot, restore } from './world.js';
+import { GameRenderer } from './render.js';
+import { AudioEngine } from './audio.js';
+import { poseShot } from './shots.js';
+import { beginMission } from './missions.js';
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+window.addEventListener('error', (event) => {
+  document.body.dataset.bootError = `${event.message} @ ${event.filename}:${event.lineno}`;
+});
+window.addEventListener('unhandledrejection', (event) => {
+  document.body.dataset.bootError = String(event.reason);
+});
 
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const SAVE_KEY = 'mirador-bay-save-v1';
+const canvas = document.getElementById('view');
+const params = new URLSearchParams(location.search);
+const shotName = params.get('shot');
+const seed = Number(params.get('seed') || '1') || 1;
+const shotMode = !!shotName;
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+function readSave() {
+  try { return JSON.parse(localStorage.getItem(SAVE_KEY)); } catch { return null; }
+}
+function writeSave(data) {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(data)); } catch { /* private mode */ }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+const world = createWorld(seed, shotMode ? 0 : ((readSave() || {}).progress || 0));
+const renderer = new GameRenderer(canvas, world, shotMode);
+const audio = new AudioEngine();
+
+let view = {
+  state: 'title', elapsed: 0, camYaw: 0,
+  menuItems: ['RESUME', 'RESTART JOB', 'TOGGLE SOUND'], menuIndex: 0,
+  fixedCamera: null,
+};
+
+const keys = new Set();
+let mouseDown = false;
+let prevE = false, prevR = false;
+let saveTimer = 0, muted = false;
+
+const BLOCKED = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab']);
+
+window.addEventListener('keydown', (event) => {
+  if (BLOCKED.has(event.code)) event.preventDefault();
+  keys.add(event.code);
+  if (event.repeat) return;
+
+  if (event.code === 'Escape') {
+    if (view.state === 'playing') view.state = 'paused';
+    else if (view.state === 'paused') view.state = 'playing';
+    return;
   }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+  if (event.code === 'Enter') { handleEnter(); return; }
+  if (view.state === 'paused') {
+    if (event.code === 'ArrowUp' || event.code === 'KeyW') view.menuIndex = (view.menuIndex + 2) % 3;
+    if (event.code === 'ArrowDown' || event.code === 'KeyS') view.menuIndex = (view.menuIndex + 1) % 3;
+    return;
   }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+  const slots = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5'];
+  const slot = slots.indexOf(event.code);
+  if (slot >= 0 && view.state === 'playing') {
+    world.player.weapon = slot;
+    world.sfx.push('beep');
   }
+});
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+window.addEventListener('keyup', (event) => keys.delete(event.code));
+window.addEventListener('blur', () => { keys.clear(); mouseDown = false; });
+
+canvas.addEventListener('mousedown', (event) => {
+  if (event.button !== 0) return;
+  mouseDown = true;
+  try { canvas.requestPointerLock(); } catch { /* optional */ }
+});
+window.addEventListener('mouseup', () => { mouseDown = false; });
+window.addEventListener('mousemove', (event) => {
+  if (document.pointerLockElement === canvas && view.state === 'playing') {
+    view.camYaw += event.movementX * 0.0032;
   }
+});
+window.addEventListener('resize', () => {
+  if (shotMode) return;
+  renderer.resize(Math.max(640, window.innerWidth), Math.max(400, window.innerHeight));
+});
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+function handleEnter() {
+  if (view.state === 'title') {
+    audio.start();
+    view.state = 'playing';
+    const saved = readSave();
+    if (saved) restore(world, saved);
+    return;
   }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
+  if (view.state === 'paused') {
+    const choice = view.menuIndex;
+    if (choice === 0) view.state = 'playing';
+    if (choice === 1) { beginMission(world, world.story.index); view.state = 'playing'; }
+    if (choice === 2) { muted = !muted; audio.setMuted(muted); }
+    return;
   }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
+  if (view.state === 'playing' && world.story.done) {
+    if (world.progress >= 5) {
+      world.story.done = false;
+      world.story.objective = 'Free roam — the city is yours.';
     } else {
-      accumulator = 0;
+      beginMission(world, world.progress);
     }
-    renderer.draw(world.state, screen, best);
   }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
-  requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+const EMPTY_INPUT = {
+  forward: 0, strafe: 0, run: false, jump: false, brake: false,
+  fire: false, reload: false, interact: false, interactHeld: false, camYaw: 0,
+};
+
+function readInput() {
+  const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+  const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const eDown = keys.has('KeyE');
+  const rDown = keys.has('KeyR');
+  const input = {
+    forward, strafe,
+    run: keys.has('ShiftLeft') || keys.has('ShiftRight'),
+    jump: keys.has('Space'),
+    brake: keys.has('ControlLeft') || keys.has('KeyC'),
+    fire: mouseDown || keys.has('KeyF'),
+    interact: eDown && !prevE,
+    interactHeld: eDown,
+    reload: rDown && !prevR,
+    camYaw: view.camYaw,
+  };
+  prevE = eDown; prevR = rDown;
+  return input;
+}
+
+// ---------- deterministic capture ----------
+
+function shotFrame(frameNumber) {
+  try {
+    document.body.dataset.shotStage = 'frame' + frameNumber;
+    // The pose is final: shot frames only draw it. Stepping here would let a
+    // mission trigger or wanted decay change the frame between runs.
+    renderer.sync(world, view, 1 / 60);
+    renderer.render();
+    if (frameNumber >= 5) {
+      document.body.dataset.shotStage = 'capture';
+      document.body.dataset.shotData = canvas.toDataURL('image/jpeg', 0.88);
+      document.body.dataset.shotReady = shotName;
+      document.body.dataset.shotW = String(canvas.width);
+    }
+  } catch (error) {
+    document.body.dataset.shotError = String(error && error.stack ? error.stack : error);
+    document.body.dataset.shotReady = 'error';
+  }
+}
+
+function runShot() {
+  try {
+    view = poseShot(world, shotName);
+    document.body.dataset.shotStage = 'posed';
+  } catch (error) {
+    document.body.dataset.shotError = 'pose: ' + String(error && error.stack ? error.stack : error);
+    document.body.dataset.shotReady = 'error';
+    return;
+  }
+  let t = 0, frame = 0;
+  while (!document.body.dataset.shotReady && t < 60000) {
+    t += 17;
+    frame++;
+    shotFrame(frame);
+  }
+  if (!document.body.dataset.shotReady) document.body.dataset.shotReady = 'timeout';
+}
+
+// ---------- ordinary play ----------
+
+let last = performance.now();
+function frameLoop(now) {
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  view.elapsed += dt;
+
+  if (view.state === 'playing') {
+    stepWorld(world, dt, readInput());
+    audio.update(world, dt);
+    audio.consume(world.sfx);
+    if (world.player.dead) view.state = 'dead';
+    saveTimer += dt;
+    if (saveTimer > 4) { saveTimer = 0; writeSave(snapshot(world)); }
+  } else {
+    audio.consume(world.sfx);
+  }
+  if (view.state === 'dead' && !world.player.dead) view.state = 'playing';
+
+  renderer.camYaw = view.camYaw;
+  renderer.sync(world, view, dt);
+  renderer.render();
+  requestAnimationFrame(frameLoop);
+}
+
+if (shotMode) runShot();
+else {
+  writeSave({ progress: world.progress });
+  requestAnimationFrame(frameLoop);
+}
